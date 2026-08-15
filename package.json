@@ -1,0 +1,17 @@
+{
+  "name": "aikeys",
+  "version": "0.1.0",
+  "description": "Small CLI for AI-agent-safe API key storage, retrieval, scanning, and template rendering.",
+  "bin": {
+    "aikeys": "bin/aikeys.js",
+    "apikeys": "bin/aikeys.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke": "AIKEYS_HOME=.tmp/aikeys AIKEYS_PASSWORD=test-password node bin/aikeys.js setup --force && printf 'secret-value\\n' | AIKEYS_HOME=.tmp/aikeys AIKEYS_PASSWORD=test-password node bin/aikeys.js set demo/key v1 && AIKEYS_HOME=.tmp/aikeys AIKEYS_PASSWORD=test-password node bin/aikeys.js get demo/key v1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

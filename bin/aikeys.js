@@ -10,6 +10,18 @@ const { spawnSync } = require('child_process');
 
 const APP = 'aikeys';
 const CONFIG_VERSION = 1;
+
+// The only algorithm/KDF pair this vault will decrypt. These are recorded on
+// every entry AND enforced on read: an attacker who can edit vault.json must
+// not be able to talk us into a weaker primitive by rewriting the metadata.
+// Threats: offline tamper of vault.json (downgrade to an unauthenticated mode,
+// or to a cheap KDF), and silent corruption. Both fail closed.
+const ALG = 'aes-256-gcm';
+const KDF = 'scrypt';
+const KEY_LEN = 32;
+const SALT_LEN = 16;
+const IV_LEN = 12;
+const TAG_LEN = 16;
 const DEFAULT_CONFIG = {
   version: CONFIG_VERSION,
   defaultStore: 'file',
@@ -259,14 +271,14 @@ function upsertMeta(config, id, version, data) {
 }
 
 function encrypt(plain, password) {
-  const salt = crypto.randomBytes(16);
-  const iv = crypto.randomBytes(12);
-  const key = crypto.scryptSync(password, salt, 32);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const salt = crypto.randomBytes(SALT_LEN);
+  const iv = crypto.randomBytes(IV_LEN);
+  const key = crypto.scryptSync(password, salt, KEY_LEN);
+  const cipher = crypto.createCipheriv(ALG, key, iv);
   const ciphertext = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   return {
-    alg: 'aes-256-gcm',
-    kdf: 'scrypt',
+    alg: ALG,
+    kdf: KDF,
     salt: salt.toString('base64'),
     iv: iv.toString('base64'),
     tag: cipher.getAuthTag().toString('base64'),
@@ -275,11 +287,27 @@ function encrypt(plain, password) {
 }
 
 function decrypt(payload, password) {
-  const key = crypto.scryptSync(password, Buffer.from(payload.salt, 'base64'), 32);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
+  // Enforce the recorded primitives instead of trusting them. vault.json is a
+  // plain file on disk; without these checks the alg/kdf fields are decoration
+  // and a tampered entry could steer decryption somewhere weaker.
+  if (!payload || typeof payload !== 'object') fail('vault entry is malformed');
+  if (payload.alg !== ALG) fail(`unsupported vault algorithm: ${payload.alg}`);
+  if (payload.kdf !== KDF) fail(`unsupported vault kdf: ${payload.kdf}`);
+
+  const salt = Buffer.from(payload.salt || '', 'base64');
+  const iv = Buffer.from(payload.iv || '', 'base64');
+  const tag = Buffer.from(payload.tag || '', 'base64');
+  // Wrong-length parameters mean a corrupt or forged entry. Reject before
+  // touching the cipher so failures stay uniform instead of leaking shape.
+  if (salt.length !== SALT_LEN) fail('vault entry has an invalid salt');
+  if (iv.length !== IV_LEN) fail('vault entry has an invalid iv');
+  if (tag.length !== TAG_LEN) fail('vault entry has an invalid auth tag');
+
+  const key = crypto.scryptSync(password, salt, KEY_LEN);
+  const decipher = crypto.createDecipheriv(ALG, key, iv);
+  decipher.setAuthTag(tag);
   return Buffer.concat([
-    decipher.update(Buffer.from(payload.ciphertext, 'base64')),
+    decipher.update(Buffer.from(payload.ciphertext || '', 'base64')),
     decipher.final()
   ]).toString('utf8');
 }

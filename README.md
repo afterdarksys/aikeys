@@ -77,3 +77,12 @@ The scanner reports likely secrets with masked values. `--import` stores finding
 - `keychain`: macOS Keychain via `security`, or Linux Secret Service via `secret-tool` when present. Unsupported platforms should use `file`.
 
 Windows currently uses the encrypted file vault. Native Windows Credential Manager support can be added behind the same `--store keychain` interface.
+
+## Agent skills
+
+Agent-ready skills live in `skills/`:
+
+- `skills/codex/aikeys-secret-access/`
+- `skills/claude/aikeys-secret-access/`
+
+See `skills/README.md` for installation notes.

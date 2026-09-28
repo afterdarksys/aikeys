@@ -353,14 +353,51 @@ function platformKeychainSupported() {
   return false;
 }
 
+// Threats: the secret leaking through process argv (readable by other local
+// users via ps or /proc), through the keychain tool's error output, or being
+// stored truncated while we report success. The secret is only ever written
+// to the tool's stdin, tool output is never echoed on a failed write, and the
+// stored value is read back and compared before success is recorded; a
+// mismatch removes the item. Does NOT protect against code running as the
+// same user, which can read the keychain item like we do.
+const KEYCHAIN_NAME_RE = /^[A-Za-z0-9_.@\/-]+$/;
+// `security -i` reads commands into a 4 KiB line buffer and splits longer
+// lines, which stores a truncated secret. Stay well below it.
+const SECURITY_LINE_MAX = 4000;
+
 function keychainSet(service, account, secret) {
+  if (!KEYCHAIN_NAME_RE.test(service) || !KEYCHAIN_NAME_RE.test(account)) {
+    fail('keychain service and account may only use letters, numbers, dot, underscore, dash, slash, or @');
+  }
+  let result;
   if (process.platform === 'darwin') {
-    run('security', ['add-generic-password', '-U', '-s', service, '-a', account, '-w', secret]);
+    // `add-generic-password -w <secret>` puts the secret in argv, and a bare
+    // trailing `-w` with the secret on stdin silently truncates it to 128
+    // bytes. Interactive mode takes the whole command on stdin, and -X passes
+    // the secret as hex so no quoting or escaping is involved.
+    const line = `add-generic-password -U -s ${service} -a ${account} -X ${Buffer.from(secret, 'utf8').toString('hex')}\n`;
+    if (line.length > SECURITY_LINE_MAX) fail('secret is too long for the macOS keychain store; use --store file');
+    result = spawnSync('security', ['-i'], { input: line, encoding: 'utf8' });
   } else if (process.platform === 'linux') {
-    run('secret-tool', ['store', '--label', `${service}:${account}`, 'service', service, 'account', account], secret);
+    // secret-tool reads the secret from stdin when stdin is not a TTY.
+    result = spawnSync('secret-tool', ['store', '--label', `${service}:${account}`, 'service', service, 'account', account], { input: secret, encoding: 'utf8' });
   } else {
     fail('native keychain store is not supported on this platform; use --store file');
   }
+  // Deliberately not echoing stderr/stdout: `security -i` repeats the command
+  // line (hex secret included) when it rejects it.
+  if (result.status !== 0) fail(`keychain write failed (exit ${result.status})`);
+  const stored = Buffer.from(keychainGet(service, account), 'utf8');
+  const expected = Buffer.from(secret, 'utf8');
+  if (stored.length !== expected.length || !crypto.timingSafeEqual(stored, expected)) {
+    keychainDelete(service, account);
+    fail('keychain read-back did not match the secret; the item was removed. Use --store file for this secret');
+  }
+}
+
+function keychainDelete(service, account) {
+  if (process.platform === 'darwin') run('security', ['delete-generic-password', '-s', service, '-a', account]);
+  else if (process.platform === 'linux') run('secret-tool', ['clear', 'service', service, 'account', account]);
 }
 
 function keychainGet(service, account) {

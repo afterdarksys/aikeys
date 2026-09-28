@@ -222,3 +222,114 @@ test('set --store keychain fails closed when no keychain tool exists', () => {
   assert.doesNotMatch(got.stdout, /stored/);
   assert.deepEqual(vaultEntries(home), {});
 });
+
+// Fake keychain tools. They stand in for macOS `security` / Linux `secret-tool`
+// so the tests never touch a real keychain, and they log every argv so we can
+// prove the secret never appears on a command line.
+const KEYCHAIN_TOOL = process.platform === 'darwin' ? 'security' : 'secret-tool';
+const keychainSkip = !['darwin', 'linux'].includes(process.platform) && 'native keychain paths exist only on darwin/linux';
+const FAKE_KEYCHAIN = `'use strict';
+const fs = require('fs');
+const path = require('path');
+const dir = process.env.FAKE_KEYCHAIN_DIR;
+const mode = process.env.FAKE_KEYCHAIN_MODE || 'ok';
+const [tool, ...args] = process.argv.slice(2);
+fs.appendFileSync(path.join(dir, 'argv.log'), JSON.stringify(args) + '\\n');
+const statePath = path.join(dir, 'state.json');
+const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {};
+const save = () => fs.writeFileSync(statePath, JSON.stringify(state));
+const stdin = () => fs.readFileSync(0, 'utf8');
+const opt = (list, flag) => list[list.indexOf(flag) + 1];
+function write(key, value) {
+  if (mode === 'fail') { process.stderr.write('refused: ' + value + '\\n'); process.exit(1); }
+  state[key] = mode === 'truncate' ? value.slice(0, 5) : value;
+  save();
+}
+if (tool === 'security') {
+  if (args[0] === '-i') {
+    const line = stdin();
+    fs.appendFileSync(path.join(dir, 'stdin.log'), line);
+    if (mode === 'fail') { process.stderr.write('security: unknown command "' + line.trim() + '"\\n'); process.exit(1); }
+    const words = line.trim().split(/\\s+/);
+    write(opt(words, '-s') + '|' + opt(words, '-a'), Buffer.from(opt(words, '-X'), 'hex').toString('utf8'));
+  } else if (args[0] === 'find-generic-password') {
+    const key = opt(args, '-s') + '|' + opt(args, '-a');
+    if (!(key in state)) process.exit(44);
+    process.stdout.write(state[key] + '\\n');
+  } else if (args[0] === 'delete-generic-password') {
+    delete state[opt(args, '-s') + '|' + opt(args, '-a')];
+    save();
+  } else process.exit(2);
+} else {
+  const key = opt(args, 'service') + '|' + opt(args, 'account');
+  if (args[0] === 'store') write(key, stdin());
+  else if (args[0] === 'lookup') { if (!(key in state)) process.exit(1); process.stdout.write(state[key]); }
+  else if (args[0] === 'clear') { delete state[key]; save(); }
+  else process.exit(2);
+}
+`;
+
+function fakeKeychain(mode = 'ok') {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-fakekc-'));
+  const bindir = path.join(dir, 'bin');
+  fs.mkdirSync(bindir);
+  fs.writeFileSync(path.join(dir, 'fake.js'), FAKE_KEYCHAIN);
+  const wrapper = path.join(bindir, KEYCHAIN_TOOL);
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${path.join(dir, 'fake.js')}" ${KEYCHAIN_TOOL} "$@"\n`, { mode: 0o755 });
+  return {
+    dir,
+    env: { PATH: `${bindir}:/usr/bin:/bin`, FAKE_KEYCHAIN_DIR: dir, FAKE_KEYCHAIN_MODE: mode },
+    argv: () => (fs.existsSync(path.join(dir, 'argv.log')) ? fs.readFileSync(path.join(dir, 'argv.log'), 'utf8') : ''),
+    state: () => (fs.existsSync(path.join(dir, 'state.json')) ? JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8')) : {})
+  };
+}
+
+test('keychain store keeps the secret out of argv and reports the store used', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain();
+  const secret = 'sk-argv-canary-$&-value';
+  const hex = Buffer.from(secret).toString('hex');
+  const set = run(home, ['set', 'demo/key', 'v1', '--store', 'keychain'], `${secret}\n`, kc.env);
+  assert.equal(set.status, 0, set.stderr);
+  assert.match(set.stdout, /stored demo\/key@v1 in keychain/);
+  assert.ok(kc.argv().length > 0, 'fake keychain tool was not invoked');
+  assert.ok(!kc.argv().includes(secret), 'secret appeared in keychain tool argv');
+  assert.ok(!kc.argv().includes(hex), 'hex-encoded secret appeared in keychain tool argv');
+  assert.equal(vaultEntries(home)['demo/key'].versions.v1.store, 'keychain');
+  const got = run(home, ['get', 'demo/key', 'v1'], undefined, kc.env);
+  assert.equal(got.status, 0, got.stderr);
+  assert.equal(got.stdout, secret);
+});
+
+test('keychain write failure does not echo the secret and stores nothing', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain('fail');
+  const secret = 'sk-leak-canary-value';
+  const hex = Buffer.from(secret).toString('hex');
+  const got = run(home, ['set', 'demo/key', '--store', 'keychain'], `${secret}\n`, kc.env);
+  assert.notEqual(got.status, 0);
+  for (const stream of [got.stdout, got.stderr]) {
+    assert.ok(!stream.includes(secret) && !stream.includes(hex), 'secret leaked in error output');
+  }
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('keychain write that silently truncates is detected and removed', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain('truncate');
+  const got = run(home, ['set', 'demo/key', '--store', 'keychain'], 'sk-truncated-secret-value\n', kc.env);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /read-back did not match/);
+  assert.deepEqual(kc.state(), {});
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('macOS keychain refuses a secret too long for security -i', { skip: process.platform !== 'darwin' && 'macOS-only line limit' }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain();
+  const got = run(home, ['set', 'demo/key', '--store', 'keychain'], `${'k'.repeat(2100)}\n`, kc.env);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /too long for the macOS keychain/);
+  assert.deepEqual(kc.state(), {});
+  assert.deepEqual(vaultEntries(home), {});
+});

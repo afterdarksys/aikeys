@@ -377,3 +377,84 @@ test('agentPolicy is flagged as advisory once per home', () => {
   assert.equal(second.status, 0);
   assert.doesNotMatch(second.stderr, /agentPolicy/);
 });
+
+// Real pseudo-terminal tests. Piped stdin never reaches the interactive prompt,
+// so these drive aikeys through a pty the way a person at a terminal does.
+const PTY_DRIVER = `
+import json, os, pty, select, sys, time
+argv, steps = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(argv[0], argv)
+out = b''
+def pump(until=None, timeout=15):
+    global out
+    end = time.time() + timeout
+    while time.time() < end:
+        if until is not None and until in out:
+            return True
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            out += chunk
+    return False
+for prompt, text in steps:
+    if not pump(prompt.encode()):
+        break
+    time.sleep(0.1)
+    os.write(fd, text.encode())
+pump()
+_, status = os.waitpid(pid, 0)
+code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+print(json.dumps({'status': code, 'out': out.decode('utf8', 'replace')}))
+`;
+const python = spawnSync('python3', ['-c', 'import pty'], { encoding: 'utf8' }).status === 0 ? 'python3' : null;
+const ptySkip = (!python || process.platform === 'win32') && 'needs python3 with the pty module';
+
+function runPty(home, args, steps, env = {}, unset = []) {
+  const fullEnv = { ...process.env, AIKEYS_HOME: home, ...env };
+  for (const k of unset) delete fullEnv[k];
+  const res = spawnSync(python, ['-c', PTY_DRIVER, JSON.stringify([process.execPath, bin, ...args]), JSON.stringify(steps)], { encoding: 'utf8', env: fullEnv, timeout: 60000 });
+  assert.equal(res.status, 0, `pty driver failed: ${res.stderr}`);
+  return JSON.parse(res.stdout);
+}
+
+test('tty: set reads a typed secret and get reads a typed password', { skip: ptySkip }, () => {
+  const home = freshHome();
+  const secret = 'sk-typed-at-a-tty-$&-value';
+  const set = runPty(home, ['set', 'demo/key', 'v1'], [['Secret: ', `${secret}\r`]], { AIKEYS_PASSWORD: 'tty-pw' }, ['AIKEYS_SECRET']);
+  assert.equal(set.status, 0, set.out);
+  assert.match(set.out, /stored demo\/key@v1 in file/);
+  assert.ok(!set.out.includes(secret), 'typed secret was echoed');
+  const get = runPty(home, ['get', 'demo/key', 'v1'], [['Vault password: ', 'tty-pw\r']], {}, ['AIKEYS_PASSWORD']);
+  assert.equal(get.status, 0, get.out);
+  assert.ok(get.out.includes(secret), `get did not print the secret: ${JSON.stringify(get.out)}`);
+  assert.ok(!get.out.includes('tty-pw'), 'typed password was echoed');
+});
+
+test('tty: set prompts for both secret and password when neither variable is set', { skip: ptySkip }, () => {
+  const home = freshHome();
+  const set = runPty(home, ['set', 'demo/key'], [['Secret: ', 'sk-two-prompts\r'], ['Vault password: ', 'pw2\r']], {}, ['AIKEYS_SECRET', 'AIKEYS_PASSWORD']);
+  assert.equal(set.status, 0, set.out);
+  assert.equal(run(home, ['get', 'demo/key'], undefined, { AIKEYS_PASSWORD: 'pw2' }).stdout, 'sk-two-prompts');
+});
+
+test('tty: Ctrl-D at the password prompt shows a visible refusal and exits 1', { skip: ptySkip }, () => {
+  const { home } = seed();
+  const got = runPty(home, ['get', 'demo/key', 'v1'], [['Vault password: ', '\x04']], {}, ['AIKEYS_PASSWORD']);
+  assert.equal(got.status, 1, got.out);
+  assert.match(got.out, /aikeys: empty vault password refused/);
+});
+
+test('tty: Ctrl-D at the secret prompt shows a visible refusal and stores nothing', { skip: ptySkip }, () => {
+  const home = freshHome();
+  const got = runPty(home, ['set', 'demo/key'], [['Secret: ', '\x04']], {}, ['AIKEYS_SECRET']);
+  assert.equal(got.status, 1, got.out);
+  assert.match(got.out, /aikeys: empty secret refused/);
+  assert.deepEqual(vaultEntries(home), {});
+});

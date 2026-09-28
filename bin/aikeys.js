@@ -116,20 +116,31 @@ async function promptHidden(label) {
 function promptTTY(label) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-    const mute = rl.output.write;
-    rl.output.write = function (stringToWrite) {
-      if (rl.stdoutMuted) return;
-      mute.call(rl.output, stringToWrite);
+    // Mute only this interface's echo. Patching process.stderr.write would
+    // also swallow our own error messages after the prompt.
+    let muted = false;
+    let answered = false;
+    const writeToOutput = rl._writeToOutput;
+    rl._writeToOutput = function (stringToWrite) {
+      if (!muted) writeToOutput.call(rl, stringToWrite);
     };
     rl.question(`${label}: `, (answer) => {
+      // close() emits 'close' synchronously, so record the answer first.
+      answered = true;
+      muted = false;
       rl.close();
       process.stderr.write('\n');
       resolve(answer);
     });
     // EOF (Ctrl-D) closes the interface without an answer; resolve empty so
     // the caller refuses it instead of the process exiting 0 with no output.
-    rl.on('close', () => resolve(''));
-    rl.stdoutMuted = true;
+    rl.on('close', () => {
+      if (answered) return;
+      muted = false;
+      process.stderr.write('\n');
+      resolve('');
+    });
+    muted = true;
   });
 }
 

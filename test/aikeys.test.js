@@ -177,3 +177,29 @@ test('render does not re-expand tokens that appear inside a secret value', () =>
   assert.equal(run(home, ['render', template, output]).status, 0);
   assert.equal(fs.readFileSync(output, 'utf8'), 'A={{aikeys:demo/inner}}\nB=INNER\n');
 });
+
+test('set refuses an empty secret from non-TTY stdin and stores nothing', () => {
+  const home = freshHome();
+  const got = runNoInput(home, ['set', 'demo/key', 'v1'], {}, ['AIKEYS_SECRET']);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /empty secret refused/);
+  assert.doesNotMatch(got.stdout, /stored/);
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('set refuses an empty vault password and stores nothing', () => {
+  const home = freshHome();
+  const got = runNoInput(home, ['set', 'demo/key', 'v1'], { AIKEYS_SECRET: 'sk-some-secret' }, ['AIKEYS_PASSWORD']);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /empty vault password refused/);
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('get refuses an empty vault password and prints nothing', () => {
+  const { home, secret } = seed();
+  const got = runNoInput(home, ['get', 'demo/key', 'v1'], {}, ['AIKEYS_PASSWORD']);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /empty vault password refused/);
+  assert.equal(got.stdout, '');
+  assert.doesNotMatch(got.stderr, new RegExp(secret));
+});

@@ -98,13 +98,21 @@ function setup(args) {
   console.log(`created ${getVaultPath(config)}`);
 }
 
+// Threats: silently doing nothing (exit 0, nothing stored or printed) when
+// stdin is empty or closed, and encrypting under an empty password. Empty
+// input from any source is refused with a non-zero exit.
 async function promptHidden(label) {
-  if (process.env.AIKEYS_PASSWORD && label.toLowerCase().includes('password')) return process.env.AIKEYS_PASSWORD;
-  if (process.env.AIKEYS_SECRET && !label.toLowerCase().includes('password')) return process.env.AIKEYS_SECRET;
-  if (!process.stdin.isTTY) {
-    const data = fs.readFileSync(0, 'utf8').trimEnd();
-    if (data) return data;
-  }
+  const isPassword = label.toLowerCase().includes('password');
+  const fromEnv = isPassword ? process.env.AIKEYS_PASSWORD : process.env.AIKEYS_SECRET;
+  let value;
+  if (fromEnv) value = fromEnv;
+  else if (!process.stdin.isTTY) value = fs.readFileSync(0, 'utf8').trimEnd();
+  else value = await promptTTY(label);
+  if (!value) fail(`empty ${label.toLowerCase()} refused`);
+  return value;
+}
+
+function promptTTY(label) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
     const mute = rl.output.write;
@@ -117,12 +125,19 @@ async function promptHidden(label) {
       process.stderr.write('\n');
       resolve(answer);
     });
+    // EOF (Ctrl-D) closes the interface without an answer; resolve empty so
+    // the caller refuses it instead of the process exiting 0 with no output.
+    rl.on('close', () => resolve(''));
     rl.stdoutMuted = true;
   });
 }
 
+// Stdin can only be read once, so a password read from a pipe is kept for the
+// rest of this process (render may decrypt several file-vault entries).
+let vaultPassword;
 async function getPassword() {
-  return promptHidden('Vault password');
+  if (vaultPassword === undefined) vaultPassword = await promptHidden('Vault password');
+  return vaultPassword;
 }
 
 function setSecret(args) {
@@ -134,7 +149,6 @@ function setSecret(args) {
     const config = readConfig();
     const resolvedStore = store || config.defaultStore || 'file';
     const secret = await promptHidden('Secret');
-    if (!secret) fail('empty secret refused');
     await saveSecret(config, id, version, secret, resolvedStore);
     console.log(`stored ${id}@${version} in ${resolvedStore}`);
   });

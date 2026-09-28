@@ -283,6 +283,7 @@ function checkStore(store) {
 // Returns the store the secret actually went to.
 async function saveSecret(config, id, version, secret, store) {
   validateId(id);
+  validateVersion(version);
   checkStore(store);
   if (store === 'keychain') {
     const account = `${id}@${version}`;
@@ -298,8 +299,9 @@ async function saveSecret(config, id, version, secret, store) {
 
 async function loadSecret(config, id, version) {
   validateId(id);
+  validateVersion(version);
   const vault = readVault(config);
-  const entry = vault.entries?.[id]?.versions?.[version];
+  const entry = vault.entries[id]?.versions[version];
   if (!entry) fail(`missing secret: ${id}@${version}`);
   if (entry.store === 'keychain') return keychainGet(config.keychainService || APP, entry.account || `${id}@${version}`);
   if (entry.store === 'file') {
@@ -311,7 +313,7 @@ async function loadSecret(config, id, version) {
 
 function upsertMeta(config, id, version, data) {
   const vault = readVault(config);
-  vault.entries[id] ||= { versions: {} };
+  vault.entries[id] ||= { versions: Object.create(null) };
   vault.entries[id].versions[version] = data;
   writeJSON(getVaultPath(config), vault);
 }
@@ -454,9 +456,13 @@ function noteAdvisoryPolicy() {
 
 function readVault(config) {
   const vaultPath = getVaultPath(config);
-  if (!fs.existsSync(vaultPath)) return { version: CONFIG_VERSION, entries: {} };
+  if (!fs.existsSync(vaultPath)) return { version: CONFIG_VERSION, entries: Object.create(null) };
   const vault = readJSON(vaultPath);
-  vault.entries ||= {};
+  // Null-prototype maps: a name can never resolve to an inherited property.
+  vault.entries = Object.assign(Object.create(null), vault.entries);
+  for (const id of Object.keys(vault.entries)) {
+    vault.entries[id].versions = Object.assign(Object.create(null), vault.entries[id].versions);
+  }
   return vault;
 }
 
@@ -510,7 +516,19 @@ function writeFileAtomic(file, data) {
   }
 }
 
+// Threats: prototype-key names (__proto__ etc.) that make a write land on an
+// object prototype, so set reports success while nothing is persisted, and
+// characters that do not belong in a keychain account or template token.
+const RESERVED_NAMES = ['__proto__', 'constructor', 'prototype'];
+
+function validateVersion(version) {
+  if (!/^[A-Za-z0-9_.-]+$/.test(version) || RESERVED_NAMES.includes(version)) {
+    fail('version must use letters, numbers, dot, underscore, or dash, and must not be __proto__, constructor, or prototype');
+  }
+}
+
 function validateId(id) {
+  if (id.split('/').some((part) => RESERVED_NAMES.includes(part))) fail('secret id must not use __proto__, constructor, or prototype');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(id)) {
     fail('secret id must look like <section>/<key> using letters, numbers, dot, underscore, or dash');
   }

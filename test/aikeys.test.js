@@ -458,3 +458,25 @@ test('tty: Ctrl-D at the secret prompt shows a visible refusal and stores nothin
   assert.match(got.out, /aikeys: empty secret refused/);
   assert.deepEqual(vaultEntries(home), {});
 });
+
+test('set and get refuse prototype-key and malformed versions and names', () => {
+  const home = freshHome();
+  for (const version of ['__proto__', 'constructor', 'prototype', 'v 1', 'v1;x', 'v1/x']) {
+    const set = run(home, ['set', 'demo/key', version], 'sk-value\n');
+    assert.notEqual(set.status, 0, `set accepted version ${version}`);
+    assert.doesNotMatch(set.stdout, /stored/);
+    const get = run(home, ['get', 'demo/key', version]);
+    assert.notEqual(get.status, 0, `get accepted version ${version}`);
+  }
+  for (const id of ['__proto__/key', 'demo/__proto__', 'constructor/prototype']) {
+    assert.notEqual(run(home, ['set', id], 'sk-value\n').status, 0, `set accepted id ${id}`);
+  }
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('names that shadow Object.prototype members are not found by get', () => {
+  const home = freshHome();
+  const got = run(home, ['get', 'demo/toString', 'hasOwnProperty']);
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /missing secret/);
+});

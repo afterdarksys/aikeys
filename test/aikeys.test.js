@@ -522,3 +522,31 @@ test('keychain tool processes do not inherit AIKEYS_PASSWORD or AIKEYS_SECRET', 
   assert.ok(log.length > 0);
   for (const line of log) assert.deepEqual(JSON.parse(line), []);
 });
+
+test('a failed rename during render removes the temp file', () => {
+  const { home } = seed();
+  const template = path.join(home, 't.env');
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-out-'));
+  const output = path.join(outDir, 'out.env');
+  fs.mkdirSync(output);
+  fs.writeFileSync(path.join(output, 'keep'), 'x');
+  fs.writeFileSync(template, 'K={{aikeys:demo/key@v1}}\n');
+  assert.notEqual(run(home, ['render', template, output]).status, 0);
+  assert.deepEqual(fs.readdirSync(outDir), ['out.env']);
+});
+
+test('render replaces a symlinked output with a regular 0600 file and leaves the link target alone', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows' }, () => {
+  const { home } = seed();
+  const template = path.join(home, 't.env');
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-out-'));
+  const target = path.join(outDir, 'target.txt');
+  const output = path.join(outDir, '.env');
+  fs.writeFileSync(target, 'ORIGINAL\n', { mode: 0o644 });
+  fs.symlinkSync(target, output);
+  fs.writeFileSync(template, 'K={{aikeys:demo/key@v1}}\n');
+  assert.equal(run(home, ['render', template, output]).status, 0);
+  const st = fs.lstatSync(output);
+  assert.ok(st.isFile() && !st.isSymbolicLink());
+  assert.equal(st.mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'ORIGINAL\n');
+});

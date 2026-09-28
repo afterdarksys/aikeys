@@ -49,7 +49,9 @@ AIKEYS_PASSWORD='vault password' AIKEYS_SECRET='secret value' aikeys set openai/
 AIKEYS_PASSWORD='vault password' aikeys get openai/api_key prod
 ```
 
-When stdin is not a terminal, the secret (or, for `get`, the vault password) is read from stdin; trailing whitespace is trimmed. Stdin can only be read once, so for `set` supply at least one of the two via its environment variable. An empty secret or password, from any source, is refused with a non-zero exit, and nothing is stored or printed.
+When stdin is not a terminal, the secret (or, for `get`, the vault password) is read from stdin; only the final line ending is removed, so other leading or trailing whitespace is kept as part of the value. Stdin can only be read once, so for `set` supply at least one of the two via its environment variable. An empty secret or password, from any source (including Ctrl-D at the prompt), is refused with a non-zero exit, and nothing is stored or printed.
+
+Versions use the same characters as names (letters, numbers, dot, underscore, dash), and `__proto__`, `constructor` and `prototype` are refused as a section, key or version.
 
 `--store` accepts `file` or `keychain`; anything else is an error. If `keychain` is requested and no native keychain is available, `set` fails rather than falling back to the file vault. The success message names the store the secret was written to.
 
@@ -70,7 +72,7 @@ aikeys render .env.template .env
 
 Every token is resolved first, then substituted in one pass, so secret values are inserted byte-for-byte (including `$&`, `$$` and similar sequences) and a token that happens to appear inside a secret value is not expanded.
 
-Rendered outputs are written atomically with `0600` permissions: `aikeys` writes a new `0600` temp file in the output's directory and renames it over the target. An existing output is replaced, so its old mode (for example a world-readable `.env`) does not survive, and a failed render leaves the previous file untouched. If the output path is a symlink, the link itself is replaced rather than followed. `vault.json` and `config.json` are written the same way.
+Rendered outputs are written atomically with `0600` permissions: `aikeys` writes a new `0600` temp file in the output's directory and renames it over the target. An existing output is replaced, so its old mode (for example a world-readable `.env`) does not survive, and a failed render leaves the previous file untouched. If the output path is a symlink, render replaces the link with a regular `0600` file; the file the link pointed to is not modified. `vault.json` and `config.json` are written the same way.
 
 ## Scan and import
 
@@ -86,7 +88,7 @@ The scanner reports likely secrets with masked values. `--import` stores finding
 - `file`: AES-256-GCM encrypted entries in `~/.apikeys/vault.json`, with a password prompted at read/write time.
 - `keychain`: macOS Keychain via `security`, or Linux Secret Service via `secret-tool` when present. Unsupported platforms should use `file`.
 
-The secret is passed to `security` and `secret-tool` on stdin, never as a command-line argument. On macOS `aikeys` drives `security -i` and sends the value hex-encoded, which limits keychain secrets to roughly 1,900 bytes (less with long service or account names); longer secrets are refused (use `file`). After every keychain write the value is read back and compared, and on a mismatch the item is deleted and `set` fails. In practice this rejects secrets `security` cannot return verbatim, such as values containing tabs or other non-printable characters. Keychain service and account names may only use letters, numbers, dot, underscore, dash, slash and `@`, so versions stored in the keychain are limited to those characters too.
+The secret is passed to `security` and `secret-tool` on stdin, never as a command-line argument. On macOS `aikeys` drives `security -i` and sends the value hex-encoded, which limits keychain secrets to roughly 1,900 bytes (less with long service or account names); longer secrets are refused (use `file`). Every keychain write goes first to a temporary staging item that is read back and compared, then deleted. Only a value that round-trips exactly is written over the real item, which is then read back again. A value the keychain cannot return verbatim is refused and the existing item, if any, is left unchanged. In practice this rejects secrets `security` prints as hex, such as values containing tabs or other non-printable characters. Secrets with leading or trailing whitespace are refused for the keychain store before anything is written; use `file` for those. The read-back is required: `security -i` reports only the exit status of its last command, and exits 0 for an add to a missing keychain file that stores nothing. Keychain service and account names may only use letters, numbers, dot, underscore, dash, slash and `@`. `security` and `secret-tool` are run with `AIKEYS_PASSWORD` and `AIKEYS_SECRET` removed from their environment.
 
 Windows currently uses the encrypted file vault. Native Windows Credential Manager support can be added behind the same `--store keychain` interface.
 

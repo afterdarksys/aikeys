@@ -537,8 +537,9 @@ function writeJSON(file, data) {
 // Threats: a crash or error mid-write leaving a truncated or empty secret
 // file, and an existing file keeping a looser mode (e.g. 0644) once secrets
 // are written into it. Data goes to a fresh 0600 temp file (O_EXCL) in the
-// target directory, is fsynced, then renamed over the target, so readers see
-// either the old file or the complete new one, always 0600. A symlink at the
+// target directory, is fsynced, then renamed over the target and the
+// directory fsynced, so readers see either the old file or the complete new
+// one, always 0600. A symlink at the
 // target is replaced, not followed. Does NOT protect against another local
 // user who can already write to the target directory.
 function writeFileAtomic(file, data) {
@@ -552,9 +553,33 @@ function writeFileAtomic(file, data) {
     fd = undefined;
     fs.renameSync(tmp, file);
   } catch (err) {
-    if (fd !== undefined) fs.closeSync(fd);
+    // Cleanup must not mask the original error or skip removing the temp file.
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch (closeErr) {
+        err.message += ` (closing the temp file also failed: ${closeErr.code})`;
+      }
+    }
     fs.rmSync(tmp, { force: true });
     throw err;
+  }
+  fsyncDir(path.dirname(file));
+}
+
+// Persist the rename itself; without this a crash can roll the directory
+// entry back to the old file. Windows cannot open directories, and some
+// filesystems reject fsync on one (EINVAL/ENOTSUP); those are the only
+// cases skipped.
+function fsyncDir(dir) {
+  if (process.platform === 'win32') return;
+  const dfd = fs.openSync(dir, 'r');
+  try {
+    fs.fsyncSync(dfd);
+  } catch (err) {
+    if (err.code !== 'EINVAL' && err.code !== 'ENOTSUP') throw err;
+  } finally {
+    fs.closeSync(dfd);
   }
 }
 

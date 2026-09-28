@@ -129,3 +129,51 @@ test('scan masks likely secrets', () => {
   assert.match(result.stdout, /openai|openai_api_key/);
   assert.doesNotMatch(result.stdout, /sk-abcdefghijklmnopqrstuvwxyz123456/);
 });
+
+// Runs aikeys with stdin wired to /dev/null (the `< /dev/null` case) and the
+// given env keys removed, so the parent environment cannot mask the behaviour.
+function runNoInput(home, args, env = {}, unset = []) {
+  const fullEnv = { ...process.env, AIKEYS_HOME: home, AIKEYS_PASSWORD: 'test-password', ...env };
+  for (const k of unset) delete fullEnv[k];
+  const devnull = fs.openSync('/dev/null', 'r');
+  try {
+    return spawnSync(process.execPath, [bin, ...args], { stdio: [devnull, 'pipe', 'pipe'], encoding: 'utf8', env: fullEnv });
+  } finally {
+    fs.closeSync(devnull);
+  }
+}
+
+function vaultEntries(home) {
+  return JSON.parse(fs.readFileSync(path.join(home, 'vault.json'), 'utf8')).entries;
+}
+
+function freshHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-'));
+  assert.equal(run(home, ['setup']).status, 0);
+  return home;
+}
+
+test('render inserts secrets literally, including $ replacement patterns', () => {
+  const home = freshHome();
+  const secrets = { a: 'sk-abc$&def', b: 'x$`y', c: "p$'q", d: 'a$$b', e: '$1$<n>' };
+  for (const [k, v] of Object.entries(secrets)) {
+    assert.equal(run(home, ['set', `demo/${k}`], `${v}\n`).status, 0);
+  }
+  const template = path.join(home, 't.env');
+  const output = path.join(home, 'o.env');
+  fs.writeFileSync(template, Object.keys(secrets).map((k) => `${k.toUpperCase()}={{aikeys:demo/${k}}}`).join('\n') + '\n');
+  assert.equal(run(home, ['render', template, output]).status, 0);
+  const expected = Object.entries(secrets).map(([k, v]) => `${k.toUpperCase()}=${v}`).join('\n') + '\n';
+  assert.equal(fs.readFileSync(output, 'utf8'), expected);
+});
+
+test('render does not re-expand tokens that appear inside a secret value', () => {
+  const home = freshHome();
+  assert.equal(run(home, ['set', 'demo/outer'], '{{aikeys:demo/inner}}\n').status, 0);
+  assert.equal(run(home, ['set', 'demo/inner'], 'INNER\n').status, 0);
+  const template = path.join(home, 't.env');
+  const output = path.join(home, 'o.env');
+  fs.writeFileSync(template, 'A={{aikeys:demo/outer}}\nB={{aikeys:demo/inner}}\n');
+  assert.equal(run(home, ['render', template, output]).status, 0);
+  assert.equal(fs.readFileSync(output, 'utf8'), 'A={{aikeys:demo/inner}}\nB=INNER\n');
+});

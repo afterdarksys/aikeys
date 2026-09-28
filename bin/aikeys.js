@@ -158,13 +158,19 @@ function renderTemplate(args) {
     const outputPath = args.shift();
     if (!templatePath || !outputPath) fail('usage: aikeys render <template> <output>');
     const config = readConfig();
-    let content = fs.readFileSync(templatePath, 'utf8');
+    const template = fs.readFileSync(templatePath, 'utf8');
     const tokenRe = /\{\{aikeys:([^}/\s]+\/[^}@\s]+)(?:@([^}\s]+))?\}\}/g;
-    const matches = [...content.matchAll(tokenRe)];
-    for (const match of matches) {
-      const secret = await loadSecret(config, match[1], match[2] || 'default');
-      content = content.replace(match[0], secret);
+    const secrets = new Map();
+    for (const match of template.matchAll(tokenRe)) {
+      const ref = `${match[1]}@${match[2] || 'default'}`;
+      if (!secrets.has(ref)) secrets.set(ref, await loadSecret(config, match[1], match[2] || 'default'));
     }
+    // Threats: secret corruption and token injection. A string replacement
+    // would expand `$&`, `$'`, `` $` `` and `$$` inside secret values, and
+    // replacing tokens one at a time would re-expand a token that appears
+    // inside an earlier secret. One pass over the template with a replacer
+    // function inserts every secret byte-for-byte.
+    const content = template.replace(tokenRe, (token, id, version) => secrets.get(`${id}@${version || 'default'}`));
     fs.writeFileSync(outputPath, content, { mode: 0o600 });
     console.log(`rendered ${outputPath}`);
   });

@@ -367,3 +367,13 @@ test('vault and config rewrites tighten a loosened mode back to 0600', () => {
   }
   assert.deepEqual(fs.readdirSync(home).filter((f) => f.endsWith('.tmp')), []);
 });
+
+test('agentPolicy is flagged as advisory once per home', () => {
+  const home = freshHome();
+  const first = run(home, ['where']);
+  assert.equal(first.status, 0);
+  assert.match(first.stderr, /agentPolicy .* advisory/);
+  const second = run(home, ['where']);
+  assert.equal(second.status, 0);
+  assert.doesNotMatch(second.stderr, /agentPolicy/);
+});

@@ -422,7 +422,23 @@ function commandExists(cmd) {
 
 function readConfig() {
   if (!fs.existsSync(getConfigPath())) fail('run `aikeys setup` first');
-  return readJSON(getConfigPath());
+  const config = readJSON(getConfigPath());
+  if (config.agentPolicy) noteAdvisoryPolicy();
+  return config;
+}
+
+// agentPolicy is guidance for agents, not a control: the CLI cannot tell an
+// agent from a human, and nothing checks allowedCommands. Say so once per
+// AIKEYS_HOME so nobody mistakes it for a sandbox.
+function noteAdvisoryPolicy() {
+  const marker = path.join(getHome(), '.agent-policy-notice');
+  if (fs.existsSync(marker)) return;
+  console.error('aikeys: note: agentPolicy in config.json is advisory only and is not enforced by aikeys (shown once)');
+  try {
+    fs.writeFileSync(marker, '', { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    if (err.code !== 'EEXIST') console.error(`aikeys: could not record the agentPolicy notice (${err.code}); it will be shown again`);
+  }
 }
 
 function readVault(config) {

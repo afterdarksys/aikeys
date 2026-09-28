@@ -235,6 +235,7 @@ const dir = process.env.FAKE_KEYCHAIN_DIR;
 const mode = process.env.FAKE_KEYCHAIN_MODE || 'ok';
 const [tool, ...args] = process.argv.slice(2);
 fs.appendFileSync(path.join(dir, 'argv.log'), JSON.stringify(args) + '\\n');
+fs.appendFileSync(path.join(dir, 'env.log'), JSON.stringify(['AIKEYS_PASSWORD', 'AIKEYS_SECRET'].filter((k) => k in process.env)) + '\\n');
 const statePath = path.join(dir, 'state.json');
 const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {};
 const save = () => fs.writeFileSync(statePath, JSON.stringify(state));
@@ -319,7 +320,7 @@ test('keychain write that silently truncates is detected and removed', { skip: k
   const kc = fakeKeychain('truncate');
   const got = run(home, ['set', 'demo/key', '--store', 'keychain'], 'sk-truncated-secret-value\n', kc.env);
   assert.notEqual(got.status, 0);
-  assert.match(got.stderr, /read-back did not match/);
+  assert.match(got.stderr, /cannot store this secret verbatim/);
   assert.deepEqual(kc.state(), {});
   assert.deepEqual(vaultEntries(home), {});
 });
@@ -479,4 +480,45 @@ test('names that shadow Object.prototype members are not found by get', () => {
   const got = run(home, ['get', 'demo/toString', 'hasOwnProperty']);
   assert.notEqual(got.status, 0);
   assert.match(got.stderr, /missing secret/);
+});
+
+test('a failed keychain update leaves the previous item and metadata intact', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain();
+  assert.equal(run(home, ['set', 'demo/key', 'v1', '--store', 'keychain'], 'sk-original-good-value\n', kc.env).status, 0);
+  const bad = run(home, ['set', 'demo/key', 'v1', '--store', 'keychain'], 'sk-replacement-value\n', { ...kc.env, FAKE_KEYCHAIN_MODE: 'truncate' });
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /nothing was changed/);
+  const got = run(home, ['get', 'demo/key', 'v1'], undefined, kc.env);
+  assert.equal(got.status, 0, got.stderr);
+  assert.equal(got.stdout, 'sk-original-good-value');
+  assert.deepEqual(Object.keys(kc.state()), [`aikeys|demo/key@v1`]);
+});
+
+test('keychain refuses leading or trailing whitespace before touching the store', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain();
+  for (const secret of ['sk-trailing-space ', ' sk-leading-space', 'sk-trailing-tab\t']) {
+    const got = run(home, ['set', 'demo/key', '--store', 'keychain'], undefined, { ...kc.env, AIKEYS_SECRET: secret });
+    assert.notEqual(got.status, 0, `accepted ${JSON.stringify(secret)}`);
+    assert.match(got.stderr, /leading or trailing whitespace/);
+  }
+  assert.equal(kc.argv(), '', 'keychain tool was invoked');
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('piped input keeps trailing spaces and loses only the final newline', () => {
+  const home = freshHome();
+  assert.equal(run(home, ['set', 'demo/key'], 'sk-ends-with-spaces  \n').status, 0);
+  assert.equal(run(home, ['get', 'demo/key']).stdout, 'sk-ends-with-spaces  ');
+});
+
+test('keychain tool processes do not inherit AIKEYS_PASSWORD or AIKEYS_SECRET', { skip: keychainSkip }, () => {
+  const home = freshHome();
+  const kc = fakeKeychain();
+  const got = run(home, ['set', 'demo/key', '--store', 'keychain'], undefined, { ...kc.env, AIKEYS_SECRET: 'sk-env-secret-value' });
+  assert.equal(got.status, 0, got.stderr);
+  const log = fs.readFileSync(path.join(kc.dir, 'env.log'), 'utf8').trim().split('\n');
+  assert.ok(log.length > 0);
+  for (const line of log) assert.deepEqual(JSON.parse(line), []);
 });

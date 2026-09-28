@@ -107,7 +107,9 @@ async function promptHidden(label) {
   const fromEnv = isPassword ? process.env.AIKEYS_PASSWORD : process.env.AIKEYS_SECRET;
   let value;
   if (fromEnv) value = fromEnv;
-  else if (!process.stdin.isTTY) value = fs.readFileSync(0, 'utf8').trimEnd();
+  // Strip only the line terminator a pipe or heredoc adds; any other
+  // whitespace is part of the value.
+  else if (!process.stdin.isTTY) value = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
   else value = await promptTTY(label);
   if (!value) fail(`empty ${label.toLowerCase()} refused`);
   return value;
@@ -368,69 +370,109 @@ function platformKeychainSupported() {
 
 // Threats: the secret leaking through process argv (readable by other local
 // users via ps or /proc), through the keychain tool's error output, or being
-// stored truncated while we report success. The secret is only ever written
-// to the tool's stdin, tool output is never echoed on a failed write, and the
-// stored value is read back and compared before success is recorded; a
-// mismatch removes the item. Does NOT protect against code running as the
-// same user, which can read the keychain item like we do.
+// stored truncated while we report success, and a failed update destroying
+// the previous good item. The secret is only ever written to the tool's stdin
+// and tool output is never echoed on a failed write. Every value is first
+// written to a staging item and read back; only a verified value is written
+// over the real item, which is then verified again. A value that cannot be
+// stored faithfully is refused before the real item is touched. Does NOT
+// protect against code running as the same user, which can read the keychain
+// item like we do.
 const KEYCHAIN_NAME_RE = /^[A-Za-z0-9_.@\/-]+$/;
 // `security -i` reads commands into a 4 KiB line buffer and splits longer
 // lines, which stores a truncated secret. Stay well below it.
 const SECURITY_LINE_MAX = 4000;
+const STAGING_SUFFIX = '.aikeys-staging';
 
 function keychainSet(service, account, secret) {
   if (!KEYCHAIN_NAME_RE.test(service) || !KEYCHAIN_NAME_RE.test(account)) {
     fail('keychain service and account may only use letters, numbers, dot, underscore, dash, slash, or @');
   }
+  // Keychain tools add or strip line endings on output, so a value with
+  // leading or trailing whitespace cannot be returned verbatim.
+  if (secret !== secret.trim()) fail('the keychain store refuses secrets with leading or trailing whitespace; use --store file');
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    fail('native keychain store is not supported on this platform; use --store file');
+  }
+  const staging = `${account}${STAGING_SUFFIX}`;
+  keychainWrite(service, staging, secret);
+  const stagedOk = keychainMatches(service, staging, secret);
+  keychainRemove(service, staging);
+  if (!stagedOk) fail('the keychain cannot store this secret verbatim; nothing was changed. Use --store file for this secret');
+  keychainWrite(service, account, secret);
+  if (!keychainMatches(service, account, secret)) {
+    fail(`keychain read-back of ${account} did not match after a verified staging write; the item may be damaged. Re-run set or use --store file`);
+  }
+}
+
+function keychainWrite(service, account, secret) {
   let result;
   if (process.platform === 'darwin') {
     // `add-generic-password -w <secret>` puts the secret in argv, and a bare
     // trailing `-w` with the secret on stdin silently truncates it to 128
     // bytes. Interactive mode takes the whole command on stdin, and -X passes
-    // the secret as hex so no quoting or escaping is involved.
+    // the secret as hex so no quoting or escaping is involved. Its exit status
+    // is only that of the last command and is 0 even when an add to a missing
+    // keychain file stores nothing, which is why every write is read back.
     const line = `add-generic-password -U -s ${service} -a ${account} -X ${Buffer.from(secret, 'utf8').toString('hex')}\n`;
     if (line.length > SECURITY_LINE_MAX) fail('secret is too long for the macOS keychain store; use --store file');
-    result = spawnSync('security', ['-i'], { input: line, encoding: 'utf8' });
-  } else if (process.platform === 'linux') {
-    // secret-tool reads the secret from stdin when stdin is not a TTY.
-    result = spawnSync('secret-tool', ['store', '--label', `${service}:${account}`, 'service', service, 'account', account], { input: secret, encoding: 'utf8' });
+    result = spawnSync('security', ['-i'], { input: line, encoding: 'utf8', env: childEnv() });
   } else {
-    fail('native keychain store is not supported on this platform; use --store file');
+    // secret-tool reads the secret from stdin when stdin is not a TTY.
+    result = spawnSync('secret-tool', ['store', '--label', `${service}:${account}`, 'service', service, 'account', account], { input: secret, encoding: 'utf8', env: childEnv() });
   }
   // Deliberately not echoing stderr/stdout: `security -i` repeats the command
   // line (hex secret included) when it rejects it.
-  if (result.status !== 0) fail(`keychain write failed (exit ${result.status})`);
-  const stored = Buffer.from(keychainGet(service, account), 'utf8');
-  const expected = Buffer.from(secret, 'utf8');
-  if (stored.length !== expected.length || !crypto.timingSafeEqual(stored, expected)) {
-    keychainDelete(service, account);
-    fail('keychain read-back did not match the secret; the item was removed. Use --store file for this secret');
+  if (result.status !== 0) {
+    if (account.endsWith(STAGING_SUFFIX)) keychainRemove(service, account);
+    fail(`keychain write failed (exit ${result.status})`);
   }
 }
 
-function keychainDelete(service, account) {
-  if (process.platform === 'darwin') run('security', ['delete-generic-password', '-s', service, '-a', account]);
-  else if (process.platform === 'linux') run('secret-tool', ['clear', 'service', service, 'account', account]);
+function keychainMatches(service, account, secret) {
+  const result = keychainLookup(service, account);
+  if (result.status !== 0) return false;
+  const stored = Buffer.from(stripNewline(result.stdout), 'utf8');
+  const expected = Buffer.from(secret, 'utf8');
+  return stored.length === expected.length && crypto.timingSafeEqual(stored, expected);
+}
+
+// Best-effort removal of our own staging item; a missing item is fine.
+function keychainRemove(service, account) {
+  if (process.platform === 'darwin') spawnSync('security', ['delete-generic-password', '-s', service, '-a', account], { env: childEnv() });
+  else spawnSync('secret-tool', ['clear', 'service', service, 'account', account], { env: childEnv() });
+}
+
+function keychainLookup(service, account) {
+  if (process.platform === 'darwin') {
+    return spawnSync('security', ['find-generic-password', '-s', service, '-a', account, '-w'], { encoding: 'utf8', env: childEnv() });
+  }
+  return spawnSync('secret-tool', ['lookup', 'service', service, 'account', account], { encoding: 'utf8', env: childEnv() });
 }
 
 function keychainGet(service, account) {
-  if (process.platform === 'darwin') {
-    return run('security', ['find-generic-password', '-s', service, '-a', account, '-w']).stdout.trimEnd();
-  }
-  if (process.platform === 'linux') {
-    return run('secret-tool', ['lookup', 'service', service, 'account', account]).stdout.trimEnd();
-  }
-  fail('native keychain get is not supported on this platform');
+  if (process.platform !== 'darwin' && process.platform !== 'linux') fail('native keychain get is not supported on this platform');
+  const result = keychainLookup(service, account);
+  if (result.status !== 0) fail((result.stderr || result.stdout || 'keychain lookup failed').trim());
+  return stripNewline(result.stdout);
 }
 
-function run(cmd, args, input) {
-  const result = spawnSync(cmd, args, { input, encoding: 'utf8' });
-  if (result.status !== 0) fail((result.stderr || result.stdout || `${cmd} failed`).trim());
-  return result;
+// `security -w` ends its output with one newline; strip exactly that.
+function stripNewline(text) {
+  return text.replace(/\n$/, '');
 }
+
+// Children never need our secrets in their environment.
+function childEnv() {
+  const env = { ...process.env };
+  delete env.AIKEYS_PASSWORD;
+  delete env.AIKEYS_SECRET;
+  return env;
+}
+
 
 function commandExists(cmd) {
-  return spawnSync(process.platform === 'win32' ? 'where' : 'command', process.platform === 'win32' ? [cmd] : ['-v', cmd], { shell: process.platform !== 'win32' }).status === 0;
+  return spawnSync(process.platform === 'win32' ? 'where' : 'command', process.platform === 'win32' ? [cmd] : ['-v', cmd], { shell: process.platform !== 'win32', env: childEnv() }).status === 0;
 }
 
 function readConfig() {

@@ -203,3 +203,22 @@ test('get refuses an empty vault password and prints nothing', () => {
   assert.equal(got.stdout, '');
   assert.doesNotMatch(got.stderr, new RegExp(secret));
 });
+
+test('set rejects an unknown --store and stores nothing', () => {
+  const home = freshHome();
+  const got = run(home, ['set', 'demo/key', '--store', 'foo'], 'sk-value\n');
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /unknown store: foo/);
+  assert.doesNotMatch(got.stdout, /stored/);
+  assert.deepEqual(vaultEntries(home), {});
+});
+
+test('set --store keychain fails closed when no keychain tool exists', () => {
+  const home = freshHome();
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-nopath-'));
+  const got = run(home, ['set', 'demo/key', '--store', 'keychain'], 'sk-value\n', { PATH: empty });
+  assert.notEqual(got.status, 0);
+  assert.match(got.stderr, /keychain store requested but no native keychain/);
+  assert.doesNotMatch(got.stdout, /stored/);
+  assert.deepEqual(vaultEntries(home), {});
+});

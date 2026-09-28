@@ -22,6 +22,7 @@ const KEY_LEN = 32;
 const SALT_LEN = 16;
 const IV_LEN = 12;
 const TAG_LEN = 16;
+const STORES = ['file', 'keychain'];
 const DEFAULT_CONFIG = {
   version: CONFIG_VERSION,
   defaultStore: 'file',
@@ -85,7 +86,7 @@ function main() {
 function setup(args) {
   const force = takeFlag(args, '--force');
   const store = takeValue(args, '--store') || DEFAULT_CONFIG.defaultStore;
-  if (!['file', 'keychain'].includes(store)) fail('--store must be file or keychain');
+  if (!STORES.includes(store)) fail('--store must be file or keychain');
   ensureHome();
   const configPath = getConfigPath();
   if (fs.existsSync(configPath) && !force) fail(`${configPath} already exists; use --force to overwrite`);
@@ -148,9 +149,10 @@ function setSecret(args) {
     if (!id) fail('usage: aikeys set <section>/<key> [version] [--store file|keychain]');
     const config = readConfig();
     const resolvedStore = store || config.defaultStore || 'file';
+    checkStore(resolvedStore);
     const secret = await promptHidden('Secret');
-    await saveSecret(config, id, version, secret, resolvedStore);
-    console.log(`stored ${id}@${version} in ${resolvedStore}`);
+    const usedStore = await saveSecret(config, id, version, secret, resolvedStore);
+    console.log(`stored ${id}@${version} in ${usedStore}`);
   });
 }
 
@@ -257,17 +259,30 @@ Environment:
 `);
 }
 
+// Threats: a typo'd store name, or a keychain that is not available, silently
+// landing the secret in the file vault while the user believes it is in the
+// keychain. Unknown or unavailable stores fail closed; there is no fallback.
+function checkStore(store) {
+  if (!STORES.includes(store)) fail(`unknown store: ${store} (expected file or keychain)`);
+  if (store === 'keychain' && !platformKeychainSupported()) {
+    fail('keychain store requested but no native keychain is available (macOS `security` or Linux `secret-tool`); use --store file');
+  }
+}
+
+// Returns the store the secret actually went to.
 async function saveSecret(config, id, version, secret, store) {
   validateId(id);
-  if (store === 'keychain' && platformKeychainSupported()) {
+  checkStore(store);
+  if (store === 'keychain') {
     const account = `${id}@${version}`;
     keychainSet(config.keychainService || APP, account, secret);
     upsertMeta(config, id, version, { store: 'keychain', account, updatedAt: new Date().toISOString() });
-    return;
+    return 'keychain';
   }
   const password = await getPassword();
   const encrypted = encrypt(secret, password);
   upsertMeta(config, id, version, { store: 'file', encrypted, updatedAt: new Date().toISOString() });
+  return 'file';
 }
 
 async function loadSecret(config, id, version) {

@@ -333,3 +333,37 @@ test('macOS keychain refuses a secret too long for security -i', { skip: process
   assert.deepEqual(kc.state(), {});
   assert.deepEqual(vaultEntries(home), {});
 });
+
+test('render tightens an existing world-readable output to 0600 and leaves no temp files', () => {
+  const { home } = seed();
+  const template = path.join(home, 't.env');
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-out-'));
+  const output = path.join(outDir, '.env');
+  fs.writeFileSync(template, 'K={{aikeys:demo/key@v1}}\n');
+  fs.writeFileSync(output, 'OLD=1\n', { mode: 0o644 });
+  fs.chmodSync(output, 0o644);
+  assert.equal(run(home, ['render', template, output]).status, 0);
+  assert.equal(fs.statSync(output).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(outDir), ['.env']);
+});
+
+test('render failure leaves an existing output untouched', () => {
+  const { home } = seed();
+  const template = path.join(home, 't.env');
+  const output = path.join(home, 'o.env');
+  fs.writeFileSync(template, 'K={{aikeys:demo/key@v1}}\nM={{aikeys:demo/missing}}\n');
+  fs.writeFileSync(output, 'OLD=1\n');
+  assert.notEqual(run(home, ['render', template, output]).status, 0);
+  assert.equal(fs.readFileSync(output, 'utf8'), 'OLD=1\n');
+});
+
+test('vault and config rewrites tighten a loosened mode back to 0600', () => {
+  const { home } = seed();
+  for (const f of ['vault.json', 'config.json']) fs.chmodSync(path.join(home, f), 0o644);
+  assert.equal(run(home, ['set', 'demo/other'], 'sk-another\n').status, 0);
+  assert.equal(run(home, ['setup', '--force']).status, 0);
+  for (const f of ['vault.json', 'config.json']) {
+    assert.equal(fs.statSync(path.join(home, f)).mode & 0o777, 0o600, `${f} not 0600`);
+  }
+  assert.deepEqual(fs.readdirSync(home).filter((f) => f.endsWith('.tmp')), []);
+});

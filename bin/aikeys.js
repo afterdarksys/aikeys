@@ -91,9 +91,9 @@ function setup(args) {
   const configPath = getConfigPath();
   if (fs.existsSync(configPath) && !force) fail(`${configPath} already exists; use --force to overwrite`);
   const config = { ...DEFAULT_CONFIG, defaultStore: store };
-  writeJSON(configPath, config, 0o600);
+  writeJSON(configPath, config);
   if (!fs.existsSync(getVaultPath(config))) {
-    writeJSON(getVaultPath(config), { version: CONFIG_VERSION, entries: {} }, 0o600);
+    writeJSON(getVaultPath(config), { version: CONFIG_VERSION, entries: {} });
   }
   console.log(`created ${configPath}`);
   console.log(`created ${getVaultPath(config)}`);
@@ -187,7 +187,7 @@ function renderTemplate(args) {
     // inside an earlier secret. One pass over the template with a replacer
     // function inserts every secret byte-for-byte.
     const content = template.replace(tokenRe, (token, id, version) => secrets.get(`${id}@${version || 'default'}`));
-    fs.writeFileSync(outputPath, content, { mode: 0o600 });
+    writeFileAtomic(outputPath, content);
     console.log(`rendered ${outputPath}`);
   });
 }
@@ -302,7 +302,7 @@ function upsertMeta(config, id, version, data) {
   const vault = readVault(config);
   vault.entries[id] ||= { versions: {} };
   vault.entries[id].versions[version] = data;
-  writeJSON(getVaultPath(config), vault, 0o600);
+  writeJSON(getVaultPath(config), vault);
 }
 
 function encrypt(plain, password) {
@@ -454,9 +454,33 @@ function readJSON(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function writeJSON(file, data, mode) {
+function writeJSON(file, data) {
   ensureHome();
-  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, { mode });
+  writeFileAtomic(file, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+// Threats: a crash or error mid-write leaving a truncated or empty secret
+// file, and an existing file keeping a looser mode (e.g. 0644) once secrets
+// are written into it. Data goes to a fresh 0600 temp file (O_EXCL) in the
+// target directory, is fsynced, then renamed over the target, so readers see
+// either the old file or the complete new one, always 0600. A symlink at the
+// target is replaced, not followed. Does NOT protect against another local
+// user who can already write to the target directory.
+function writeFileAtomic(file, data) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  let fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 function validateId(id) {

@@ -550,3 +550,210 @@ test('render replaces a symlinked output with a regular 0600 file and leaves the
   assert.equal(st.mode & 0o777, 0o600);
   assert.equal(fs.readFileSync(target, 'utf8'), 'ORIGINAL\n');
 });
+
+// exec: secrets go into one child's environment and nowhere else. The child
+// below reports a SHA-256 fingerprint of what it received (never the value),
+// and touches a marker file so negative tests can prove it never started.
+const childScript = [
+  "const fs = require('fs');",
+  "const crypto = require('crypto');",
+  "if (process.env.MARKER) fs.writeFileSync(process.env.MARKER, 'ran');",
+  "const v = process.env.DEMO_KEY;",
+  "process.stdout.write(JSON.stringify({",
+  "  fingerprint: v ? crypto.createHash('sha256').update(v).digest('hex') : null,",
+  "  password: process.env.AIKEYS_PASSWORD ?? null,",
+  "  argv: process.argv.slice(1),",
+  "}));",
+  "process.exit(Number(process.env.EXIT_WITH || 0));",
+].join('\n');
+
+function setExecConfig(home, mutate) {
+  const configPath = path.join(home, 'config.json');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  mutate(config);
+  fs.writeFileSync(configPath, JSON.stringify(config));
+}
+
+// Most exec tests use ad-hoc --env, which a real config must opt into.
+function execSeed({ adhoc = true } = {}) {
+  const { home, secret } = seed('sk-EXEC-secret-value-123');
+  const marker = path.join(home, 'child-ran');
+  if (adhoc) setExecConfig(home, (c) => { c.exec = { allowAdhocEnv: true }; });
+  return { home, secret, marker };
+}
+
+const sha = (v) => crypto.createHash('sha256').update(v).digest('hex');
+
+test('exec puts the secret in the child env without printing it', () => {
+  const { home, secret, marker } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript, 'x; touch pwned'], undefined, { MARKER: marker });
+  assert.equal(got.status, 0, got.stderr);
+  const report = JSON.parse(got.stdout);
+  assert.equal(report.fingerprint, sha(secret));
+  assert.ok(!got.stdout.includes(secret) && !got.stderr.includes(secret));
+  // No shell: the argument arrives verbatim and is never executed.
+  assert.deepEqual(report.argv, ['x; touch pwned']);
+  assert.ok(!fs.existsSync(path.join(process.cwd(), 'pwned')));
+});
+
+test('exec children do not inherit AIKEYS_PASSWORD', () => {
+  const { home } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript]);
+  assert.equal(JSON.parse(got.stdout).password, null);
+});
+
+test('exec passes the child exit code through', () => {
+  const { home } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], undefined, { EXIT_WITH: '7' });
+  assert.equal(got.status, 7);
+});
+
+function assertNeverRan(got, marker, secret, label) {
+  assert.notEqual(got.status, 0, `${label}: expected non-zero exit`);
+  assert.ok(!fs.existsSync(marker), `${label}: child must not start`);
+  assert.ok(!got.stdout.includes(secret) && !got.stderr.includes(secret), `${label}: secret leaked`);
+}
+
+test('exec fails closed on a missing secret and never starts the child', () => {
+  const { home, secret, marker } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--env', 'OTHER_KEY=demo/missing', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker });
+  assertNeverRan(got, marker, secret, 'missing secret');
+});
+
+test('exec fails closed on a wrong vault password', () => {
+  const { home, secret, marker } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker, AIKEYS_PASSWORD: 'wrong' });
+  assertNeverRan(got, marker, secret, 'wrong password');
+});
+
+test('exec refuses variables that control loading or lookup', () => {
+  const { home, secret, marker } = execSeed();
+  for (const name of ['PATH', 'NODE_OPTIONS', 'DYLD_INSERT_LIBRARIES', 'LD_PRELOAD', 'AIKEYS_PASSWORD', 'BASH_ENV']) {
+    const got = run(home, ['exec', '--env', `${name}=demo/key@v1`, '--', process.execPath, '-e', childScript], undefined, { MARKER: marker });
+    assertNeverRan(got, marker, secret, name);
+  }
+});
+
+test('exec refuses malformed, duplicate and prototype mappings', () => {
+  const { home, secret, marker } = execSeed();
+  const cases = [
+    ['--env', 'lower=demo/key@v1'],
+    ['--env', 'DEMO_KEY'],
+    ['--env', 'DEMO_KEY=nokey'],
+    ['--env', 'DEMO_KEY=__proto__/key'],
+    ['--env', 'DEMO_KEY=demo/key@v1', '--env', 'DEMO_KEY=demo/key@v1'],
+    ['--profile', '__proto__'],
+    ['--profile', 'nope'],
+    ['--bogus', 'x'],
+    [],
+  ];
+  for (const opts of cases) {
+    const got = run(home, ['exec', ...opts, '--', process.execPath, '-e', childScript], undefined, { MARKER: marker });
+    assertNeverRan(got, marker, secret, JSON.stringify(opts));
+  }
+  const noCommand = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--']);
+  assert.notEqual(noCommand.status, 0);
+});
+
+test('exec resolves a named profile from config', () => {
+  const { home, secret } = execSeed();
+  setExecConfig(home, (c) => { c.profiles = { studio: { DEMO_KEY: 'demo/key@v1' } }; });
+  const got = run(home, ['exec', '--profile', 'studio', '--', process.execPath, '-e', childScript]);
+  assert.equal(got.status, 0, got.stderr);
+  assert.equal(JSON.parse(got.stdout).fingerprint, sha(secret));
+});
+
+test('exec logs names to a 0600 exec.log and never the value', () => {
+  const { home, secret } = execSeed();
+  assert.equal(run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript]).status, 0);
+  const logPath = path.join(home, 'exec.log');
+  const log = fs.readFileSync(logPath, 'utf8');
+  assert.match(log, /DEMO_KEY=demo\/key@v1/);
+  assert.ok(!log.includes(secret));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(logPath).mode & 0o777, 0o600);
+});
+
+test('exec refuses to run when it cannot record the exec', () => {
+  const { home, secret, marker } = execSeed();
+  fs.mkdirSync(path.join(home, 'exec.log')); // appendFile on a directory fails
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker });
+  assertNeverRan(got, marker, secret, 'unwritable audit log');
+});
+
+test('exec refuses ad-hoc --env unless config opts in', () => {
+  const { home, secret, marker } = execSeed({ adhoc: false });
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker });
+  assertNeverRan(got, marker, secret, 'ad-hoc env without opt-in');
+});
+
+test('a command-bound profile runs only its commands', () => {
+  const { home, secret, marker } = execSeed({ adhoc: false });
+  setExecConfig(home, (c) => {
+    c.profiles = { bound: { env: { DEMO_KEY: 'demo/key@v1' }, commands: [[process.execPath, '-e', childScript]] } };
+  });
+  const ok = run(home, ['exec', '--profile', 'bound', '--', process.execPath, '-e', childScript, 'extra-arg']);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout).fingerprint, sha(secret));
+  // The classic dump: same profile, different program.
+  const dump = run(home, ['exec', '--profile', 'bound', '--', process.execPath, '-e', "require('fs').writeFileSync(process.env.MARKER,'ran');console.log(process.env.DEMO_KEY)"], undefined, { MARKER: marker });
+  assertNeverRan(dump, marker, secret, 'unbound command');
+  for (const bad of [{ env: { DEMO_KEY: 'demo/key@v1' }, commands: [] }, { env: { DEMO_KEY: 'demo/key@v1' }, commands: 'node' }, { env: ['x'] }]) {
+    setExecConfig(home, (c) => { c.profiles = { bound: bad }; });
+    assertNeverRan(run(home, ['exec', '--profile', 'bound', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker }), marker, secret, JSON.stringify(bad));
+  }
+});
+
+test('exec only sets credential-shaped names unless allowlisted', () => {
+  const { home, secret, marker } = execSeed();
+  assertNeverRan(run(home, ['exec', '--env', 'DEMO_THING=demo/key@v1', '--', process.execPath, '-e', childScript], undefined, { MARKER: marker }), marker, secret, 'non-credential name');
+  setExecConfig(home, (c) => { c.exec.allowNames = ['DEMO_THING']; });
+  assert.equal(run(home, ['exec', '--env', 'DEMO_THING=demo/key@v1', '--', process.execPath, '-e', childScript]).status, 0);
+});
+
+test('exec refuses execution, network and TLS steering names even when allowlisted', () => {
+  const { home, secret, marker } = execSeed();
+  const names = ['NPM_CONFIG_SCRIPT_SHELL', 'GIT_CONFIG_COUNT', 'GIT_ASKPASS', 'HTTPS_PROXY', 'ALL_PROXY', 'NODE_EXTRA_CA_CERTS',
+    'NODE_TLS_REJECT_UNAUTHORIZED', 'PYTHONWARNINGS', 'PIP_INDEX_URL', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'EDITOR', 'SSH_ASKPASS', 'REQUESTS_CA_BUNDLE'];
+  setExecConfig(home, (c) => { c.exec.allowNames = names; });
+  for (const name of names) {
+    assertNeverRan(run(home, ['exec', '--env', `${name}=demo/key@v1`, '--', process.execPath, '-e', childScript], undefined, { MARKER: marker }), marker, secret, name);
+  }
+});
+
+test('exec never reads the vault password from piped stdin', () => {
+  const { home, secret, marker } = execSeed();
+  const got = run(home, ['exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], 'test-password\n', { MARKER: marker, AIKEYS_PASSWORD: '' });
+  assertNeverRan(got, marker, secret, 'password on stdin');
+  assert.match(got.stderr, /stdin belongs to the command/);
+});
+
+test('exec.log records are one JSON object per line and cannot be forged by a newline in cwd', { skip: process.platform === 'win32' && 'newline paths' }, () => {
+  const { home } = execSeed();
+  const evil = path.join(home, 'x\n2026-01-01T00:00:00Z exec forged cwd=x FAKE_KEY=a.b');
+  fs.mkdirSync(evil);
+  const got = spawnSync(process.execPath, [bin, 'exec', '--env', 'DEMO_KEY=demo/key@v1', '--', process.execPath, '-e', childScript], {
+    cwd: evil, encoding: 'utf8', env: { ...process.env, AIKEYS_HOME: home, AIKEYS_PASSWORD: 'test-password' },
+  });
+  assert.equal(got.status, 0, got.stderr);
+  const lines = fs.readFileSync(path.join(home, 'exec.log'), 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1);
+  const record = JSON.parse(lines[0]);
+  assert.equal(record.cwd, fs.realpathSync(evil));
+  assert.deepEqual(record.map, ['DEMO_KEY=demo/key@v1']);
+  assert.equal(record.argv[0], process.execPath);
+});
+
+test('a profile bound to a directory refuses to run anywhere else', () => {
+  const { home, secret, marker } = execSeed({ adhoc: false });
+  const allowedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aikeys-cwd-'));
+  setExecConfig(home, (c) => {
+    c.profiles = { here: { env: { DEMO_KEY: 'demo/key@v1' }, commands: [[process.execPath]], cwd: [allowedDir] } };
+  });
+  const runIn = (cwd) => spawnSync(process.execPath, [bin, 'exec', '--profile', 'here', '--', process.execPath, '-e', childScript], {
+    cwd, encoding: 'utf8', env: { ...process.env, AIKEYS_HOME: home, AIKEYS_PASSWORD: 'test-password', MARKER: marker },
+  });
+  assertNeverRan(runIn(home), marker, secret, 'wrong directory');
+  const ok = runIn(allowedDir);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout).fingerprint, sha(secret));
+});

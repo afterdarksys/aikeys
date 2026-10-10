@@ -1,6 +1,6 @@
 ---
 name: aikeys-secret-access
-description: Use the aikeys CLI to safely retrieve, render, scan, and import API keys or secrets for coding tasks. Use when Claude needs to populate config files from secret templates, fetch a named API key, scan a project tree for accidental secrets, or explain how to use the repository's aikeys secret workflow without exposing raw secret values.
+description: Use the aikeys CLI to run commands that need API keys (fal, ElevenLabs, Hedra, Anthropic...) without ever seeing the key, and to render, scan, and import secrets. Use when Claude needs to populate config files from secret templates, fetch a named API key, scan a project tree for accidental secrets, or explain how to use the repository's aikeys secret workflow without exposing raw secret values.
 ---
 
 # aikeys Secret Access
@@ -21,6 +21,7 @@ Use these commands from the project or shell environment where `aikeys` is avail
 aikeys setup
 aikeys set <section>/<key> [version]
 aikeys get <section>/<key> [version]
+aikeys exec [--profile <name>] [--env NAME=section/key[@version]]... -- <command> [args...]
 aikeys render <template> <output>
 aikeys scan <dir-tree>
 aikeys scan <dir-tree> --import
@@ -50,15 +51,18 @@ Render it with:
 aikeys render .env.template .env
 ```
 
-## Retrieval Workflow
-
-When a command requires a secret in an environment variable, prefer command-local substitution and avoid echoing it:
+## Running a command that needs a key (use this first)
 
 ```sh
-OPENAI_API_KEY="$(aikeys get openai/api_key prod)" npm test
+aikeys exec --env FAL_KEY=fal/api_key -- npm run space:art
+aikeys exec --profile studio -- npx tsx pipeline/produce.ts --estimate
 ```
 
-Before using this pattern, check whether shell tracing or verbose logging is enabled and disable it if needed.
+`exec` puts the secret straight into the child process's environment. You never see it, it never hits stdout or disk, and every run is recorded by name in `~/.apikeys/exec.log`. If a key is missing it fails before running anything. In that case, tell the user which `section/key` to store (`aikeys set fal/api_key --store keychain`). Don't go looking for the key in other files.
+
+Profiles are defined under `"profiles"` in `~/.apikeys/config.json`. Run `aikeys where` to find it.
+
+Avoid `VAR="$(aikeys get ...)" cmd`. `get` writes the raw value to stdout, so a traced shell or a mistyped command puts the secret in your transcript.
 
 ## Scanning Workflow
 

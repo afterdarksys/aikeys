@@ -5,8 +5,9 @@ This repository provides `aikeys`, a local API key and secret helper intended fo
 ## Agent Rules
 
 - Never print secret values in logs, summaries, commits, or chat.
+- To run a command that needs a key, use `aikeys exec --env NAME=section/key -- <command>` (or `--profile <name>`). The value goes straight into the child's environment and never into your context.
 - Prefer `aikeys render <template> <output>` over manually copying secrets into config files.
-- Use `aikeys get <section>/<key> [version]` only when a tool genuinely needs the raw secret on stdout.
+- Use `aikeys get <section>/<key> [version]` only when a tool genuinely needs the raw secret on stdout. An agent should almost never do this: stdout lands in its transcript.
 - Do not edit `~/.apikeys/vault.json` directly.
 - Do not commit rendered files such as `.env` unless the user explicitly says the file is safe.
 
@@ -16,6 +17,7 @@ This repository provides `aikeys`, a local API key and secret helper intended fo
 aikeys setup
 aikeys set openai/api_key prod
 aikeys get openai/api_key prod
+aikeys exec --profile studio -- npm run build
 aikeys render .env.template .env
 aikeys scan . --import
 ```

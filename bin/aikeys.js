@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const APP = 'aikeys';
 const CONFIG_VERSION = 1;
@@ -66,6 +66,8 @@ function main() {
         return getSecret(args);
       case 'render':
         return renderTemplate(args);
+      case 'exec':
+        return execWithSecrets(args);
       case 'scan':
         return scan(args);
       case 'where':
@@ -107,6 +109,9 @@ async function promptHidden(label) {
   const fromEnv = isPassword ? process.env.AIKEYS_PASSWORD : process.env.AIKEYS_SECRET;
   let value;
   if (fromEnv) value = fromEnv;
+  else if (execMode && !process.stdin.isTTY) {
+    fail('exec reads the vault password only from AIKEYS_PASSWORD or a terminal; stdin belongs to the command');
+  }
   // Strip only the line terminator a pipe or heredoc adds; any other
   // whitespace is part of the value.
   else if (!process.stdin.isTTY) value = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
@@ -145,6 +150,9 @@ function promptTTY(label) {
     muted = true;
   });
 }
+
+// Set by exec: fd 0 is the child's, so secrets and passwords never come from it.
+let execMode = false;
 
 // Stdin can only be read once, so a password read from a pipe is kept for the
 // rest of this process (render may decrypt several file-vault entries).
@@ -205,6 +213,194 @@ function renderTemplate(args) {
   });
 }
 
+// Threats: a secret reaching an agent's transcript, a log or shell history
+// when the agent only needed to hand it to a program. `exec` resolves named
+// secrets and puts them straight into ONE child process's environment: nothing
+// is printed or written to disk, and the audit log records names and argv,
+// never values. It fails closed: every secret resolves before the child
+// starts, so a missing, empty or undecryptable one means nothing runs. No
+// shell is involved. Only credential-shaped variable names can be set (or
+// names listed in config), and names that steer how programs load code, find
+// executables, reach the network or trust TLS are refused outright, so a
+// stored value can never redirect execution or traffic.
+// A profile may bind its secrets to specific commands; then any other command
+// is refused, so `exec --profile studio -- printenv` cannot dump the keys.
+// Does NOT protect against: a command that is allowed printing or uploading
+// the value, or an agent that can EDIT the program a bound command runs
+// (package.json scripts, the script file itself) — binding narrows accidents
+// and casual misuse, it is not a sandbox. Nor against code running as the same
+// user (it can read the keychain as we do) or anyone holding AIKEYS_PASSWORD.
+// Harnesses should also deny `aikeys get`, `aikeys set` and `security
+// find-generic-password` to agents; see README.
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+const CREDENTIAL_NAME_RE = /_(API_KEY|KEY|TOKEN|SECRET|PAT|PASSWORD)$/;
+const EXEC_DENY_EXACT = new Set([
+  'PATH', 'HOME', 'SHELL', 'USER', 'IFS', 'ENV', 'BASH_ENV', 'PS4', 'PROMPT_COMMAND',
+  'PERL5LIB', 'PERL5OPT', 'RUBYOPT', 'RUBYLIB', 'TMPDIR',
+  'EDITOR', 'VISUAL', 'PAGER', 'SSH_ASKPASS', 'SUDO_ASKPASS', 'REQUESTS_CA_BUNDLE'
+]);
+// Second layer behind the credential-name allowlist (config allowNames could
+// otherwise re-open these): loaders, interpreters, package managers, VCS,
+// TLS trust and proxies.
+const EXEC_DENY_PREFIX = ['LD_', 'DYLD_', 'AIKEYS_', 'NODE_', 'NPM_CONFIG_', 'GIT_', 'PYTHON', 'PIP_', 'SSL_', 'CURL_'];
+const EXEC_DENY_SUFFIX = ['_PROXY'];
+
+function checkEnvName(name, allowNames, origin) {
+  if (!ENV_NAME_RE.test(name)) fail(`${origin}: environment name must be UPPER_SNAKE_CASE: ${name}`);
+  if (
+    EXEC_DENY_EXACT.has(name) ||
+    EXEC_DENY_PREFIX.some((prefix) => name.startsWith(prefix)) ||
+    EXEC_DENY_SUFFIX.some((suffix) => name.endsWith(suffix))
+  ) {
+    fail(`${origin}: refusing to set ${name}; it controls how programs load, run or connect`);
+  }
+  if (!CREDENTIAL_NAME_RE.test(name) && !allowNames.includes(name)) {
+    fail(`${origin}: ${name} does not look like a credential (…_API_KEY, _KEY, _TOKEN, _SECRET, _PAT, _PASSWORD); list it under exec.allowNames in config.json to allow it`);
+  }
+}
+
+function parseEnvMapping(spec, origin, allowNames) {
+  const eq = spec.indexOf('=');
+  if (eq <= 0) fail(`${origin}: expected NAME=section/key[@version], got "${spec}"`);
+  const name = spec.slice(0, eq);
+  const ref = spec.slice(eq + 1);
+  checkEnvName(name, allowNames, origin);
+  const at = ref.indexOf('@');
+  const id = at === -1 ? ref : ref.slice(0, at);
+  const version = at === -1 ? 'default' : ref.slice(at + 1);
+  validateId(id);
+  validateVersion(version);
+  return { name, id, version };
+}
+
+// A profile is either a flat {NAME: "section/key"} map (any command), or
+// {"env": {...}, "commands": [["npm", "run", "space:art"], ...], "cwd": [...]}:
+// the command must start with one of those argv prefixes, element for
+// element, and — when "cwd" is given — run from one of those directories, so
+// `npm run space:art` in some other project's package.json doesn't qualify.
+function resolveProfile(config, profileName, command, allowNames) {
+  const profiles = Object.assign(Object.create(null), config.profiles);
+  const profile = RESERVED_NAMES.includes(profileName) ? undefined : profiles[profileName];
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+    fail(`unknown profile: ${profileName} (define it under "profiles" in ${getConfigPath()})`);
+  }
+  const bound = Object.prototype.hasOwnProperty.call(profile, 'env');
+  const env = bound ? profile.env : profile;
+  if (!env || typeof env !== 'object' || Array.isArray(env)) fail(`profile ${profileName}: "env" must be an object`);
+  if (bound) {
+    const commands = profile.commands;
+    if (!Array.isArray(commands) || !commands.length || !commands.every((c) => Array.isArray(c) && c.length && c.every((a) => typeof a === 'string'))) {
+      fail(`profile ${profileName}: "commands" must be a non-empty list of argv prefixes`);
+    }
+    const allowed = commands.some((prefix) => prefix.length <= command.length && prefix.every((arg, i) => arg === command[i]));
+    if (!allowed) fail(`profile ${profileName} is not bound to this command; allowed: ${commands.map((c) => c.join(' ')).join(' | ')}`);
+    if (profile.cwd !== undefined) {
+      if (!Array.isArray(profile.cwd) || !profile.cwd.every((d) => typeof d === 'string' && path.isAbsolute(d))) {
+        fail(`profile ${profileName}: "cwd" must be a list of absolute directories`);
+      }
+      const here = fs.realpathSync(process.cwd());
+      const ok = profile.cwd.some((dir) => {
+        try {
+          return fs.realpathSync(dir) === here;
+        } catch {
+          return false; // a configured directory that no longer exists matches nothing
+        }
+      });
+      if (!ok) fail(`profile ${profileName} only runs from: ${profile.cwd.join(' | ')}`);
+    }
+  }
+  const mappings = [];
+  for (const [name, ref] of Object.entries(env)) {
+    if (typeof ref !== 'string') fail(`profile ${profileName}: ${name} must map to "section/key[@version]"`);
+    mappings.push(parseEnvMapping(`${name}=${ref}`, `profile ${profileName}`, allowNames));
+  }
+  return mappings;
+}
+
+function execWithSecrets(args) {
+  return runAsync(async () => {
+    const sep = args.indexOf('--');
+    if (sep === -1 || sep === args.length - 1) {
+      fail('usage: aikeys exec [--profile <name>]... [--env NAME=section/key[@version]]... -- <command> [args...]');
+    }
+    const options = args.slice(0, sep);
+    const command = args.slice(sep + 1);
+    const config = readConfig();
+    const execPolicy = config.exec && typeof config.exec === 'object' ? config.exec : {};
+    const allowNames = Array.isArray(execPolicy.allowNames) ? execPolicy.allowNames.filter((n) => typeof n === 'string') : [];
+
+    const mappings = [];
+    while (options.length) {
+      const flag = options.shift();
+      const value = options.shift();
+      if (!value) fail(`${flag} requires a value`);
+      if (flag === '--env') {
+        // Ad-hoc mappings bypass profile command binding; opt in explicitly.
+        if (execPolicy.allowAdhocEnv !== true) fail('--env is disabled; use a --profile, or set exec.allowAdhocEnv: true in config.json');
+        mappings.push(parseEnvMapping(value, '--env', allowNames));
+      } else if (flag === '--profile') mappings.push(...resolveProfile(config, value, command, allowNames));
+      else fail(`unknown exec option: ${flag}`);
+    }
+    if (!mappings.length) fail('exec needs at least one --env or --profile');
+    const seen = new Set();
+    for (const { name } of mappings) {
+      if (seen.has(name)) fail(`${name} is mapped more than once`);
+      seen.add(name);
+    }
+
+    // Resolve everything before starting anything. fd 0 belongs to the
+    // child: never read the vault password from a pipe here.
+    execMode = true;
+    const env = childEnv();
+    for (const { name, id, version } of mappings) {
+      const value = await loadSecret(config, id, version);
+      if (!value) fail(`secret ${id}@${version} is empty; refusing to run`);
+      env[name] = value;
+    }
+
+    auditExec(mappings, command);
+    const child = spawn(command[0], command.slice(1), { stdio: 'inherit', env, shell: false });
+    // ^C and ^\ already reach the child through the terminal's process group;
+    // forwarding them again would read as a second, forcing interrupt. Ignore
+    // them here and pass on only the signals a supervisor sends to us alone.
+    for (const signal of ['SIGINT', 'SIGQUIT']) process.on(signal, () => {});
+    for (const signal of ['SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+    child.on('error', (err) => {
+      // Only a failure to start is fatal; a kill() error must not orphan a
+      // running child by exiting under it.
+      if (child.pid === undefined) fail(`could not start ${command[0]}: ${err.code || err.message}`);
+    });
+    child.on('exit', (code, signal) => {
+      if (signal) process.exit(128 + (os.constants.signals[signal] || 1));
+      process.exit(code ?? 1);
+    });
+  });
+}
+
+// One JSON object per line, so a newline in a path or argument cannot forge a
+// record. Names and full argv, never values. Opened without following
+// symlinks and tightened to 0600 every time. Fails closed: an exec that
+// cannot be recorded does not run.
+function auditExec(mappings, command) {
+  const record = {
+    t: new Date().toISOString(),
+    argv: command,
+    cwd: process.cwd(),
+    map: mappings.map((m) => `${m.name}=${m.id}@${m.version}`)
+  };
+  let fd;
+  try {
+    ensureHome();
+    fd = fs.openSync(path.join(getHome(), 'exec.log'), fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, `${JSON.stringify(record)}\n`);
+  } catch (err) {
+    fail(`could not record this exec in exec.log (${err.code}); refusing to run`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 function scan(args) {
   return runAsync(async () => {
     const doImport = takeFlag(args, '--import');
@@ -258,6 +454,7 @@ Usage:
   aikeys set <section>/<key> [version] [--store file|keychain]
   aikeys get <section>/<key> [version]
   aikeys render <template> <output>
+  aikeys exec [--profile <name>]... [--env NAME=section/key[@version]]... -- <command> [args...]
   aikeys scan <dir-tree> [--import]
   aikeys where
 
@@ -453,7 +650,8 @@ function keychainLookup(service, account) {
 function keychainGet(service, account) {
   if (process.platform !== 'darwin' && process.platform !== 'linux') fail('native keychain get is not supported on this platform');
   const result = keychainLookup(service, account);
-  if (result.status !== 0) fail((result.stderr || result.stdout || 'keychain lookup failed').trim());
+  // Fixed message: never echo the tool's output, same rule as keychainWrite.
+  if (result.status !== 0) fail(`keychain lookup failed for ${account} (exit ${result.status})`);
   return stripNewline(result.stdout);
 }
 
